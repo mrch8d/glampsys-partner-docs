@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GlampSys Partner API v1</title>
+    <meta
+      name="description"
+      content="Reference for the GlampSys Partner API: availability, rates, quotes with holds and reservations for booking portals."
+    />
+  </head>
+  <body>
+    <!--
+      Static reference page. No bundler, no build step: the spec lives next to
+      this file and Scalar renders it in the browser.
+
+      The Scalar version is PINNED on purpose. `latest` would let an upstream
+      release change what partners see without anyone on our side touching
+      this repository — the same kind of silent drift the contract gate exists
+      to prevent for the spec itself.
+    -->
+    <script
+      id="api-reference"
+      data-url="./partner-v1.openapi.yaml"
+      data-configuration='{"theme":"default","hideDownloadButton":false,"defaultOpenAllTags":false}'
+    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.68.0/dist/browser/standalone.js"></script>
+  </body>
+</html>
