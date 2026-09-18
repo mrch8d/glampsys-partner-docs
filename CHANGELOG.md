@@ -8,6 +8,46 @@ adds something, a **patch** fixes documentation or examples.
 We add fields to responses without a version bump. Treat unknown fields and
 unknown enum values as valid.
 
+## 1.1.0 — 2026-09-18
+
+### Live
+
+- `GET /ari` is deployed. Availability, an indicative nightly rate and the
+  stay restrictions, per unit and per day.
+
+  `available` and `available_count` are the same numbers the GlampSys booking
+  engine shows a guest on the web that day — the endpoint runs the same code,
+  so a day you can sell here is a day the operator can sell.
+
+  `price` is **indicative**. It is one night starting that day, from the rate
+  plan (including dynamic pricing), with your line's markup applied, rounded
+  to whole CZK. It deliberately excludes promotions, which depend on the
+  length and timing of the real stay: `POST /quotes` is the binding price and
+  will come out at or below the sum of the nights you see here.
+
+  The booking window is **not** applied: a day past the operator's booking
+  window can still read as available, exactly as it does on the web. `GET
+  /units` gives you `booking_window_months` per unit; `POST /quotes` enforces
+  it.
+
+### Added
+
+- `GET /ari` takes an optional `currency` query parameter (`CZK` default,
+  `EUR`). `EUR` is only honoured on a line that has it enabled with a fixed
+  exchange rate; anywhere else every day comes back with a null `price` and
+  `price_unavailable_reason: CURRENCY_NOT_ENABLED` instead of being silently
+  priced in CZK. Amounts are always minor units — haléře for CZK, cents for
+  EUR, never rounded to whole euros.
+
+### Changed
+
+- `AriDay.date` is declared as a `YYYY-MM-DD` pattern instead of
+  `format: date`. The value on the wire is unchanged — it was and is a plain
+  `"2026-10-01"` string. Only the declaration changed, so that the generated
+  validators accept what the endpoint actually sends. `GET /ari` was
+  `planned` until this release, so nothing was built against the old
+  declaration.
+
 ## 1.0.1 — 2026-09-10
 
 ### Fixed

@@ -40,7 +40,7 @@
 openapi: 3.1.0
 info:
   title: GlampSys Partner API
-  version: 1.0.1
+  version: 1.1.0
   description: |
     The GlampSys Partner API lets a booking channel (Glamping.cz first) read
     unit availability and rates, price a stay, hold inventory, and confirm,
@@ -267,22 +267,35 @@ paths:
   /ari:
     get:
       operationId: getAri
-      x-status: planned
       tags: [ARI]
       summary: Get availability, rate and restriction data per day
       description: |
-        **Status: planned, not yet deployed.** Calling this today returns a
-        generic `404 Not Found` from the router, not the response documented
-        here.
-
         Returns, for each requested unit and each day in range: whether it is
         available, the remaining pool count, the minimum stay that applies if
         a stay started that day, and whether arrival/departure is allowed
-        that weekday. `price` mirrors what `POST /quotes` would charge for a
-        single night starting that day, already including any automatic
-        promotion; it is `null` when the unit is unavailable that day, or
-        when the partner's line has `EUR` selected but no fixed exchange rate
-        configured (`price_unavailable_reason` explains which).
+        that weekday.
+
+        `available` and `available_count` are the same numbers the GlampSys
+        booking engine shows a guest on the web for that day, computed by the
+        same code — so a day you can see here is a day the operator can sell.
+
+        **`price` is indicative, not binding.** It is one night starting that
+        day, taken from the rate plan (including any dynamic pricing) with
+        your line's `price_markup_percent` applied and rounded to whole CZK.
+        It deliberately does **not** include promotions: those depend on the
+        length and timing of the actual stay, so they can only be resolved by
+        `POST /quotes`, which is the binding price. Expect a quote to come out
+        at or below the sum of the nights you see here.
+
+        `price` is `null` when the unit is not available that day, and when
+        you ask for `EUR` on a line that does not have it enabled with a
+        fixed exchange rate — `price_unavailable_reason` tells the two apart.
+
+        The booking window is **not** applied here: a day beyond the
+        operator's booking window can still read as available, exactly as it
+        does on the web. `GET /units` gives you `booking_window_months` per
+        unit if you want to grey those days out yourself; `POST /quotes`
+        enforces it.
 
         Supports conditional requests the same way as `GET /units`.
       parameters:
@@ -309,9 +322,22 @@ paths:
           in: query
           required: true
           description: Last day of the range, inclusive. Maximum 366 days
-            after `from`.
+            counting both ends; a longer range is a `400`.
           schema:
             $ref: "#/components/schemas/DateQueryParam"
+        - name: currency
+          in: query
+          required: false
+          description: |
+            Currency for `price`. `EUR` is only honoured on a line that has
+            EUR enabled with a fixed exchange rate; on any other line every
+            day comes back with a null `price` and a
+            `price_unavailable_reason` of `CURRENCY_NOT_ENABLED`, rather than
+            being silently priced in CZK.
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Currency"
+            default: CZK
       responses:
         "200":
           description: Per-unit, per-day availability and pricing.
@@ -1667,7 +1693,12 @@ components:
       properties:
         date:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
+          description: |
+            Calendar day, `YYYY-MM-DD`. Deliberately declared with a pattern
+            instead of `format: date` — see this file's header on dates and
+            timestamps for why.
+          example: "2026-10-01"
         available:
           type: boolean
           description: Whether at least one unit of this listing can start a
