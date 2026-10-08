@@ -1,4 +1,4 @@
-# Partner API v1 — public contract for external partners (Glamping.cz first).
+# Partner API v1 — public contract for external partners (glampingcz.cz first).
 #
 # This file is the source of truth for `partner-zod` codegen
 # (lib/api-spec/orval.config.ts) and for the published docs site
@@ -42,7 +42,7 @@ info:
   title: GlampSys Partner API
   version: 1.1.0
   description: |
-    The GlampSys Partner API lets a booking channel (Glamping.cz first) read
+    The GlampSys Partner API lets a booking channel (glampingcz.cz first) read
     unit availability and rates, price a stay, hold inventory, and confirm,
     modify or cancel a reservation — without touching the GlampSys admin
     panel.
@@ -67,7 +67,7 @@ info:
       real money.
     - `gsp_test_…` — sandbox. Scoped to a dedicated demo property with fake
       units; nothing it touches is ever real. Use it for integration testing
-      and for Glamping.cz's own CI.
+      and for glampingcz.cz's own CI.
 
     A token that fails to authenticate returns `401 UNAUTHORIZED`. A token
     that authenticates but whose partner account is paused, or whose request
@@ -616,8 +616,8 @@ paths:
                 gdpr: true
                 accepted_at: "2026-09-10T08:04:30.000Z"
                 source: glamping_cz_checkout
-                terms_url: "https://glamping.cz/terms"
-                cancellation_policy_url: "https://glamping.cz/storno"
+                terms_url: "https://glampingcz.cz/terms"
+                cancellation_policy_url: "https://glampingcz.cz/storno"
               partner_reservation_reference: GCZ-ORDER-99182
       responses:
         "201":
