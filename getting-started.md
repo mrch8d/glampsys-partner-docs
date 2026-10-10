@@ -7,13 +7,19 @@ and confirm the reservation once payment has cleared.
 The full reference is generated from the OpenAPI 3.1 contract and is the source
 of truth. This page explains how the pieces fit together.
 
-## What is live today
+## Implemented read-only scope (M0/M1)
+
+Implementation status below is not a claim that a particular partner account
+or credential has been provisioned. Validate your issued sandbox token before
+starting development. The reservation flow below describes planned operations,
+not a permission to send orders or payments.
 
 | Endpoint | Status |
 |---|---|
 | `GET /ping` | live |
 | `GET /units` | live |
-| everything else | planned — in the contract, marked `x-status: planned` |
+| `GET /ari` | live — availability, indicative rates and daily restrictions |
+| quotes, holds, reservations and webhooks | planned — in the contract, marked `x-status: planned` |
 
 Planned operations are published early on purpose, so you can build against the
 final contract before we deploy them. Their shape will not change without a
@@ -43,7 +49,35 @@ whose access is closed — your account is paused, or your source IP is outside
 the configured allow-list — returns `403 FORBIDDEN`.
 
 Start by calling `GET /ping`. It checks the token and tells you how many units
-you can reach, without side effects.
+you can reach, without creating a reservation or holding inventory. Read
+requests still update operational token-usage timestamps and rate counters.
+
+## Read-only first run
+
+The base URL is `https://glampsys.cz/api/partner/v1`. Use an individually
+issued sandbox token, never a production token, for this acceptance sequence:
+
+1. `GET /ping` — expect `200`, `environment: "sandbox"` and the agreed demo
+   unit count.
+2. `GET /units` — save the returned `unit_id` or `partner_unit_id`.
+3. `GET /ari?unit_id=SANDBOX-1&from=2027-06-11&to=2027-06-13&currency=CZK`
+   — replace the alias and dates with your agreed demo mapping and a suitable
+   future range. `unit_id` is **required**; repeat it for multiple units
+   (`unit_id=SANDBOX-1&unit_id=SANDBOX-POOL`). `unit_ids` is not a parameter.
+4. Repeat the same units/ARI request with its `ETag` in `If-None-Match`:
+   unchanged data returns `304` without a body.
+
+ARI includes both `from` and `to`, allows at most 366 days and 100 units in
+one call, and uses date-only `YYYY-MM-DD` values for local calendar nights.
+Each day has `available`, `available_count`, `min_stay`, `arrival_allowed`,
+`departure_allowed`, and `price`. A price is
+`{"amount_minor": 320000, "currency": "CZK"}`, not a decimal nightly amount.
+`price: null` can mean an unsellable night; when EUR is not configured it
+also has `price_unavailable_reason: "CURRENCY_NOT_ENABLED"`. Do not replace
+that with a made-up currency conversion.
+
+For this phase, call only these three GET endpoints. ARI is not a binding
+quote and must not be used to collect payment.
 
 ## Identifiers
 
@@ -54,11 +88,11 @@ you can reach, without side effects.
 - A unit that is not mapped to you returns `404 NOT_FOUND`, never `403`, so the
   response does not reveal whether it exists.
 
-## The booking flow
+## The complete booking flow (writes planned)
 
 ```
 GET  /units                       once a day — conditions of stay
-GET  /ari?from=…&to=…             every 1–3 h — availability, rates, restrictions
+GET  /ari?unit_id=…&from=…&to=…    every 1–3 h — availability, rates, restrictions
 POST /quotes      hold: false     "check availability" on the listing page
 POST /quotes      hold: true      guest submits the order — dates are held
 POST /reservations/confirm        after your payment gateway confirms payment
@@ -93,7 +127,7 @@ Allowed arrival and departure days use ISO 8601: `1` is Monday, `7` is Sunday.
 `null` means there is no restriction. An empty list would mean "never", so the
 API does not send one.
 
-## Idempotency
+## Idempotency (planned write operations)
 
 Every `POST` that changes state requires an `Idempotency-Key` header (the one
 exception is `POST /quotes` with `"hold": false`, which changes nothing).
@@ -139,8 +173,8 @@ Limits are per partner and per class of endpoint, counted per minute:
 | write | confirm, modify, cancel, `DELETE /quotes` | 600 / min |
 
 The classes are independent. Exhausting `quote` — for example because a bot is
-hammering your booking form — never blocks `write`, so a reservation your guest
-has already paid for always goes through. Over the limit you get
+hammering your booking form — does not consume the `write` bucket; write
+requests still have their own limit. Over the limit you get
 `429 RATE_LIMITED` with a `Retry-After` header; wait that many seconds.
 
 ## Webhooks (planned)
