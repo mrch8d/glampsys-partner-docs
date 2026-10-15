@@ -26,12 +26,20 @@
 #   - a computed response timestamp (e.g. `generated_at`) is a bare
 #     `type: string` with NO `format` — orval then emits plain `zod.string()`,
 #     which matches what the route actually returns.
-#   - a calendar date used in a REQUEST OR RESPONSE BODY (`check_in`,
-#     `check_out`, quote/reservation timestamps) uses `format: date` /
-#     `format: date-time`, matching the rest of this repo's contract
-#     convention (`CreateBookingBody.checkIn`) — these are `planned`
-#     endpoints today, so no route depends on the exact shape yet; whoever
-#     implements them should follow the `bodyWithDates` pattern.
+#   - a calendar date on a DEPLOYED endpoint — request or response body
+#     (`AriDay.date`, the quote's `check_in` / `check_out` / `nightly[].date`)
+#     — is `type: string` with a `YYYY-MM-DD` pattern, never `format: date`:
+#     the wire value is a plain string both ways, and the generated validator
+#     has to accept exactly that. A timestamp on a deployed endpoint
+#     (`expires_at`, `created_at`, milestone `from` / `until`) is a bare
+#     `type: string` like `generated_at` above.
+#   - `planned` endpoints (reservation modify, webhooks) still use
+#     `format: date` / `format: date-time`, matching the rest of this repo's
+#     contract convention (`CreateBookingBody.checkIn`). No route depends on
+#     that shape yet; whoever deploys one switches it to the two rules above
+#     in the same change, as `GET /ari` (1.1.0), the quote endpoints (1.2.0),
+#     the reservation confirm / lookup / list endpoints (1.3.0) and
+#     reservation cancel (1.4.0) did.
 #   - a date used as a QUERY PARAMETER never uses `format: date` (query
 #     strings are always strings; `useDates` would make them `zod.date()`
 #     with no coercion). It uses `type: string` with a `YYYY-MM-DD` pattern
@@ -40,7 +48,7 @@
 openapi: 3.1.0
 info:
   title: GlampSys Partner API
-  version: 1.1.0
+  version: 1.4.0
   description: |
     The GlampSys Partner API lets a booking channel (Glamping.cz first) read
     unit availability and rates, price a stay, hold inventory, and confirm,
@@ -49,8 +57,8 @@ info:
 
     ## Status of this document
 
-    This v1.0.0 contract already describes every endpoint planned for the
-    first release. Endpoints not yet live are marked `x-status: planned` on
+    This contract already describes every endpoint planned for the first
+    release. Endpoints not yet live are marked `x-status: planned` on
     the operation and say so again in their description. Calling one today
     returns `404 NOT_FOUND` in the standard error envelope with
     `error.details.reason` set to `UNKNOWN_ENDPOINT` — that `reason` is how you
@@ -89,6 +97,33 @@ info:
     not per HTTP attempt — retries of the *same* action should reuse the same
     key.
 
+    The details, so a retry loop can be written without guessing:
+
+    - A key is 1–255 printable ASCII characters (`0x20`–`0x7E`). Anything
+      else is `400 INVALID_REQUEST` with `error.details.header` set to
+      `Idempotency-Key`. An empty header counts as a missing one
+      (`400 IDEMPOTENCY_KEY_REQUIRED`).
+    - Keys are scoped to your partner account **and** to the token's
+      environment: the same key used with a sandbox token and with a
+      production token are two unrelated keys.
+    - "The same request" means the same endpoint, path parameters, query
+      and JSON body; key order inside the body does not matter.
+    - A replayed response carries the header `Idempotent-Replayed: true`. Its
+      body is the stored original byte for byte, so a replayed error still
+      carries the `error.request_id` of the **original** request, while the
+      `X-Request-ID` header names the retry.
+    - If the original request is still being processed, the retry gets
+      `409 IDEMPOTENCY_KEY_REUSED` with `error.details.state` set to
+      `in_progress`. Wait and retry with the same key; once the original
+      finishes you get its stored response. A request abandoned mid-flight
+      (for example by a crashed server) is taken over by the next retry
+      after 60 seconds.
+    - Successful (`2xx`) responses and deterministic rejections (`4xx`) are
+      stored and replayed for 48 hours. Two kinds of response are **not**
+      stored, so retrying with the same key does real work again: server
+      errors (`5xx`) and `429` (rate limit or hold cap — both clear up on
+      their own; honour `Retry-After`).
+
     ## Request correlation
 
     Every response, success or error, carries `X-Request-ID`. Error bodies
@@ -106,6 +141,13 @@ info:
     rate-limit reasons. Exceeding a limit returns `429 RATE_LIMITED` with a
     `Retry-After` header (seconds) and `error.details.class` naming which
     limit was hit.
+
+    `POST /quotes` with `hold: true` has a second, separate cap: the number
+    of holds you may have active at once — overall (per environment) and per
+    unit. Hitting it also returns `429 RATE_LIMITED`, but with
+    `error.details.rule` set to `HOLD_LIMIT` instead of `details.class`, and
+    `Retry-After` set to the seconds until your oldest active hold in that
+    scope expires. `DELETE /quotes/{quote_id}` frees a slot immediately.
 
     ## Errors
 
@@ -284,8 +326,11 @@ paths:
         your line's `price_markup_percent` applied and rounded to whole CZK.
         It deliberately does **not** include promotions: those depend on the
         length and timing of the actual stay, so they can only be resolved by
-        `POST /quotes`, which is the binding price. Expect a quote to come out
-        at or below the sum of the nights you see here.
+        `POST /quotes`, which is the binding price. It is also the price for
+        the unit's included occupancy: where the operator prices by the number
+        and ages of guests, the quote adds the per-guest surcharges for the
+        actual group. A quote can therefore come out below or above the sum of
+        the nights you see here.
 
         `price` is `null` when the unit is not available that day, and when
         you ask for `EUR` on a line that does not have it enabled with a
@@ -389,30 +434,88 @@ paths:
   /quotes:
     post:
       operationId: createQuote
-      x-status: planned
       tags: [Quotes]
       summary: Price a stay, optionally holding inventory
       description: |
-        **Status: planned, not yet deployed.**
-
         Prices a unit for a date range the same way the public booking engine
-        does — same rates, same automatic promotions, same local-tax rule —
-        and, when `hold: true`, atomically reserves the inventory for a short
-        window so the price cannot be sold out from under the partner while
-        the guest is completing checkout elsewhere. A held quote that is
-        never confirmed or cancelled expires on its own; it never blocks
-        inventory indefinitely.
+        does — same rates (including dynamic pricing), same automatic
+        promotions, same local-tax rule — with your line's
+        `price_markup_percent` applied, and, when `hold: true`, atomically
+        reserves the inventory for a short window so the stay cannot be sold
+        out from under you while the guest completes checkout with you.
 
-        `hold: false` returns the same price breakdown without reserving
-        anything or requiring `guest` — use it for a shopping-cart price
-        preview. `Idempotency-Key` is required whenever `hold: true`; it is
-        not required (and has no effect) when `hold: false`, since no state
-        is created.
+        **`hold: true`** reserves the dates and returns `201` with a
+        `quote_id`, `status: "held"` and `expires_at`. The hold lasts
+        `hold_ttl_seconds` (your account's setting, 1800 seconds unless agreed
+        otherwise, between 300 and 3600). It is serialized against every other
+        sale of the same unit — a guest booking on the operator's own website,
+        another of your quotes — so of two requests for the last free unit
+        exactly one gets the hold and the other `409 UNAVAILABLE`. A hold that
+        is never confirmed or released expires on its own and frees the dates
+        within about a minute; release it earlier with
+        `DELETE /quotes/{quote_id}` as soon as you know the guest left.
+        `Idempotency-Key` is required.
 
-        Every partner line has caps on concurrently held quotes, both overall
-        and per unit — protection against a runaway retry loop starving
-        every other guest of inventory. Hitting either cap returns
-        `422 BUSINESS_RULE_VIOLATION`.
+        **`hold: false`** returns `200` with the same price and the same
+        checks, against live availability, without reserving anything:
+        `status: "priced"`, `quote_id: null`, `expires_at: null`. Use it for
+        a price check on your listing page. It does not need an
+        `Idempotency-Key`, ignores one if sent, and does not count towards
+        the hold cap. A `priced` quote cannot be confirmed — only a held one
+        can.
+
+        **Checks, in this order — the first failing one is returned:**
+
+        | Check | Error |
+        |---|---|
+        | JSON shape, required fields, real calendar dates, `check_out` after `check_in` (at most 366 nights), `currency` is `CZK` or `EUR` | `400 INVALID_REQUEST` |
+        | `Idempotency-Key` present when `hold: true` | `400 IDEMPOTENCY_KEY_REQUIRED` |
+        | the requested currency is enabled on the unit's line (`EUR` needs a fixed exchange rate) | `422 BUSINESS_RULE_VIOLATION`, `details.rule = CURRENCY` |
+        | `guest` sent with `hold: false` | `400 INVALID_REQUEST` |
+        | the unit is mapped to you and active | `404 NOT_FOUND` (or `403 FORBIDDEN` when its location is paused) |
+        | `adults + children` fits the unit's `max_guests` | `422`, `details.rule = CAPACITY` |
+        | arrival within the booking window, and not in the past (Prague calendar day) | `422`, `details.rule = BOOKING_WINDOW` |
+        | every night inside the unit's season | `422`, `details.rule = OUT_OF_SEASON` |
+        | arrival / departure weekday allowed | `422`, `details.rule = ARRIVAL_DAY` / `DEPARTURE_DAY` |
+        | minimum stay (the rate's minimum, lowered for a single-night gap) | `422`, `details.rule = MIN_STAY` |
+        | every night has a configured price | `409 UNAVAILABLE`, `details.reason = PRICE_NOT_CONFIGURED` |
+        | the dates are free (for a pool unit: at least one unit free every night) | `409 UNAVAILABLE` |
+        | your hold caps (`hold: true` only) | `429 RATE_LIMITED`, `details.rule = HOLD_LIMIT` |
+
+        Every `422` carries the rule's limit in `details` (for example
+        `min_nights`, `max_guests`, `latest_check_in`, `allowed_weekdays`) so
+        you can explain the refusal to the guest without another call.
+
+        **Hold caps.** Your account allows a number of concurrently held
+        quotes per environment (`scope: "partner"`, 200 unless agreed
+        otherwise) and per unit (`scope: "unit"`, 3 unless agreed otherwise).
+        A held quote stops counting the moment it expires, is released or is
+        confirmed. Over a cap: `429 RATE_LIMITED` with
+        `details: { rule: "HOLD_LIMIT", scope, limit }` and `Retry-After`
+        until your oldest hold in that scope expires.
+
+        **Money.** `breakdown` sums to `total_price_minor`. In `CZK`, every
+        night is marked up and rounded to whole crowns before it is added
+        up, the promotion line is marked up and rounded on its own, and the
+        local tax (`fee × all guests × nights`, never marked up) is a line of
+        its own when your line collects it (`taxes.local_tax.included`). In
+        `EUR`, the CZK total is converted once at the line's fixed rate
+        (fixed into `fx_rate` for the life of the quote) and rounded to
+        cents; the promotion and local-tax lines are converted on their own
+        and the accommodation line takes the rounding remainder, so the lines
+        still sum to the total exactly. `nightly` is informational — in `EUR`
+        its sum can differ from the accommodation line by a few cents.
+
+        **Guests and price.** Where the operator prices by the number and ages
+        of guests, the nightly price includes per-guest surcharges for the
+        group you send — `adults` and the age of every child on the arrival
+        day — exactly as the public booking engine prices the same group. The
+        surcharges are part of the nights (and so of `accommodation`), not a
+        separate line. Where the operator does not price by guests, the group
+        only affects capacity checks and the local tax. Always send the real
+        group: a quote for two adults is not valid for four.
+
+        **Pets** (`guests.pets`) are accepted and stored but never priced.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -448,6 +551,8 @@ paths:
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
+            Idempotent-Replayed:
+              $ref: "#/components/headers/IdempotentReplayed"
           content:
             application/json:
               schema:
@@ -497,17 +602,24 @@ paths:
           example: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
     get:
       operationId: getQuote
-      x-status: planned
       tags: [Quotes]
       summary: Look up a previously created quote
       description: |
-        **Status: planned, not yet deployed.**
+        Returns a held quote you created — the price exactly as it was quoted
+        (later rate changes never touch it) and its current `status`:
+        `held`, `expired`, `cancelled` or `confirmed`.
 
-        Returns the quote in its current state — `held`, `priced`, `expired`,
-        `cancelled` or `confirmed`. An expired quote is still returned here
-        (with `status: "expired"`); it only becomes a hard error
-        (`410 QUOTE_EXPIRED`) when you try to *act* on it via
-        `POST /reservations/confirm`.
+        A hold whose `expires_at` has passed is reported as `expired` even
+        if the background sweep has not released it yet; from that moment it
+        no longer holds the dates for you and no longer counts towards your
+        hold cap. An expired quote is still returned here, and for 24 hours
+        after `expires_at` it can still be confirmed if the dates are still
+        free (late payment — see `POST /reservations/confirm`); after that,
+        confirming it is `410 QUOTE_EXPIRED`.
+
+        A quote created with another partner's token, or with the other
+        environment's token (sandbox vs. production), is `404 NOT_FOUND`.
+        `priced` quotes (`hold: false`) have no id and cannot be looked up.
       responses:
         "200":
           description: The quote, in its current state.
@@ -531,32 +643,36 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
     delete:
       operationId: cancelQuote
-      x-status: planned
       tags: [Quotes]
       summary: Release a held quote before it expires
       description: |
-        **Status: planned, not yet deployed.**
-
         Releases the inventory hold immediately instead of waiting for the
         quote to expire on its own — use it as soon as you know the guest
-        abandoned checkout. Idempotent: cancelling an already-cancelled or
-        already-expired quote returns `200` again, not an error. Cancelling a
-        quote that was already confirmed into a reservation is rejected
-        (`409 QUOTE_ALREADY_USED`) — cancel the reservation instead.
+        abandoned checkout. The dates are free again for everyone (your own
+        `GET /ari`, the operator's website, other channels) and the slot in
+        your hold cap is freed.
+
+        Returns the quote in its new current state — the same body as
+        `GET /quotes/{quote_id}`. Idempotent: releasing an already-cancelled
+        or already-expired quote returns `200` again with its current status
+        (`cancelled` or `expired`), not an error. A hold whose `expires_at`
+        has already passed is reported as `expired`, not `cancelled`.
+        Releasing a quote that was already confirmed into a reservation is
+        rejected (`409 QUOTE_ALREADY_USED`) — cancel the reservation instead.
+        No `Idempotency-Key` is needed.
       responses:
         "200":
-          description: The quote is now cancelled (or already was).
+          description: The quote is no longer held (released now, or earlier).
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QuoteCancellationResult"
-              example:
-                quote_id: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
-                status: cancelled
-                cancelled_at: "2026-09-10T08:05:00.000Z"
+                $ref: "#/components/schemas/Quote"
+              examples:
+                quoteCancelled:
+                  $ref: "#/components/examples/QuoteCancelled"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -571,26 +687,81 @@ paths:
   /reservations/confirm:
     post:
       operationId: confirmReservation
-      x-status: planned
       tags: [Reservations]
       summary: Confirm a held quote into a reservation
       description: |
-        **Status: planned, not yet deployed.**
-
         Turns a held quote into a real reservation. The guest has already
-        paid the partner directly at this point — GlampSys treats the
-        reservation as paid on confirmation and never charges the guest
-        again or issues an automatic invoice; the partner is the merchant of
+        paid you at this point — GlampSys records the reservation as paid on
+        confirmation, never charges the guest again and never issues an
+        automatic invoice or payment reminder for it; you are the merchant of
         record for this booking.
 
-        GlampSys re-prices the quote's unit and dates at confirmation time
-        and compares it against the held quote's total; if they differ by
-        more than the line's configured tolerance (inventory or a promotion
-        changed underneath the hold), confirmation is rejected with
-        `409 PRICE_MISMATCH` rather than silently honouring a stale price —
-        create a fresh quote and confirm that instead. `Idempotency-Key` is
-        required; retrying the same key after a network timeout returns the
-        same reservation rather than creating a second one.
+        **The price is the quote's price.** GlampSys does not re-price the
+        stay at confirmation: the reservation gets exactly the total that was
+        quoted (and frozen) in `POST /quotes`, in the quote's currency and at
+        the quote's fixed exchange rate. You tell GlampSys what the guest
+        actually paid (`payment`); it must be in the quote's currency and
+        within your account's price tolerance of `total_price_minor` (zero
+        unless agreed otherwise), otherwise the confirmation is rejected with
+        `409 PRICE_MISMATCH` and nothing is created. A difference inside the
+        tolerance is accepted and recorded for the operator.
+
+        `Idempotency-Key` is required. Retrying the same key with the same
+        body after a network timeout returns the same reservation (with
+        `Idempotent-Replayed: true`), never a second one.
+
+        **Late payment (confirming after the hold expired).** Your payment
+        flow may finish after `expires_at` — the hold lasts about 30 minutes
+        and a guest can take longer. A quote whose hold has expired is
+        therefore *not* rejected automatically: for **24 hours after
+        `expires_at`** GlampSys re-checks, under the same lock every other
+        sale of the unit takes, whether the stay can still be sold — the
+        unit is still mapped to you and active, the location is not paused,
+        every night is still in season, arrival is not in the past and the
+        dates are still free (for a pool unit: one unit free every night). If
+        so, the reservation is created at the quoted price, exactly as if the
+        hold had still been there. If not, the answer is `409 UNAVAILABLE`
+        with `details.reason = "HOLD_EXPIRED"` — nothing is created and you
+        refund the guest. After the 24-hour window the quote is
+        `410 QUOTE_EXPIRED`; a quote you released yourself with
+        `DELETE /quotes/{quote_id}` is `410 QUOTE_EXPIRED` straight away,
+        with `details.status = "cancelled"`.
+
+        **Checks, in this order — the first failing one is returned:**
+
+        | Check | Error |
+        |---|---|
+        | JSON shape, required fields, `consents.terms` and `consents.gdpr` both `true`, `payment.status` is `paid`, real timestamps, `partner_reservation_id` format | `400 INVALID_REQUEST` (`details.field`) |
+        | `Idempotency-Key` present | `400 IDEMPOTENCY_KEY_REQUIRED` |
+        | `quote_id` is a held quote you created with this environment's token | `404 NOT_FOUND` |
+        | the quote is not already confirmed | `409 QUOTE_ALREADY_USED` |
+        | the quote was not released by you, and its hold expired less than 24 hours ago | `410 QUOTE_EXPIRED` (`details.status`) |
+        | the unit is still mapped to you and active | `404 NOT_FOUND` (or `403 FORBIDDEN` when its location is paused for you) |
+        | `partner_reservation_id` not used before by your account | `409 CONFLICT` |
+        | `payment.currency` equals the quote's currency | `409 PRICE_MISMATCH` |
+        | `payment.total_price_minor` within your tolerance of the quote's `total_price_minor` | `409 PRICE_MISMATCH` |
+        | late payment only: the stay can still be sold (see above) | `409 UNAVAILABLE`, `details.reason = HOLD_EXPIRED` |
+        | the location's owner has not paused sales over the held dates | `409 UNAVAILABLE`, `details.reason = SALES_PAUSED` |
+
+        A sales pause the owner sets while your hold is running covers the
+        hold: the dates stay closed when the hold ends, and a confirmation
+        inside the pause is refused (`SALES_PAUSED`) — refund the guest.
+
+        **Guest emails.** After confirmation GlampSys may email the guest,
+        in `guest.language`, according to the email policy agreed for each
+        location you are linked to: a booking confirmation without any
+        payment details (it names you and your `partner_reservation_id`, and
+        links the guest's online check-in portal), arrival instructions and
+        other stay emails, or nothing at all. GlampSys never sends a guest of
+        a partner reservation a payment request, reminder or invoice, and
+        never emails anyone before confirmation. Sandbox reservations send
+        no guest email at all. `guest_portal_url` in the response is the same
+        portal link — hand it to the guest yourself if you send your own
+        confirmation.
+
+        A sandbox token confirms sandbox quotes into sandbox reservations
+        (demo location only); they never become visible to a production
+        token, and vice versa.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -605,12 +776,15 @@ paths:
               $ref: "#/components/schemas/ConfirmReservationBody"
             example:
               quote_id: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+              partner_reservation_id: GCZ-938482
+              partner_reservation_reference: GCZ-ORDER-99182
               guest:
                 first_name: Jana
                 last_name: Nováková
                 email: jana.novakova@example.com
                 phone: "+420700123456"
                 language: cs
+                nationality: CZ
               consents:
                 terms: true
                 gdpr: true
@@ -618,13 +792,22 @@ paths:
                 source: glamping_cz_checkout
                 terms_url: "https://glamping.cz/terms"
                 cancellation_policy_url: "https://glamping.cz/storno"
-              partner_reservation_reference: GCZ-ORDER-99182
+              payment:
+                status: paid
+                total_price_minor: 648900
+                currency: CZK
+                paid_at: "2026-09-10T08:04:52.000Z"
+              notes: "We will arrive around 18:00."
       responses:
         "201":
-          description: Reservation created.
+          description: Reservation created (or, for a replayed
+            `Idempotency-Key`, the reservation created by the original
+            request).
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
+            Idempotent-Replayed:
+              $ref: "#/components/headers/IdempotentReplayed"
           content:
             application/json:
               schema:
@@ -641,13 +824,78 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/QuoteAlreadyUsed"
+          $ref: "#/components/responses/ConfirmConflict"
         "410":
           $ref: "#/components/responses/Gone"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
-        "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /reservations:
+    get:
+      operationId: listReservations
+      tags: [Reservations]
+      summary: List your reservations changed since a point in time
+      description: |
+        Reconciliation feed: every reservation of yours (in this token's
+        environment) whose record changed at or after `updated_since`,
+        oldest change first — confirmations, modifications, cancellations,
+        completed stays. Sorted by the time of the last change and then by
+        an internal tie-breaker, so the order is stable while you page.
+
+        Page through with `cursor`: pass the previous page's `next_cursor`
+        unchanged (it is opaque — do not build or parse it) and keep the
+        same `updated_since`. `next_cursor` is `null` on the last page. A
+        reservation that changes again while you page moves to the end of
+        the feed, so you may see it twice — treat the feed as "at least
+        once" and upsert by `reservation_id`.
+
+        A good loop: remember the largest `updated_at` you have processed,
+        and on the next run ask for `updated_since` = that value. This
+        endpoint complements webhooks; it does not replace
+        `GET /reservations/{partner_reservation_id}` for a single lookup.
+      parameters:
+        - name: updated_since
+          in: query
+          required: false
+          description: ISO 8601 timestamp with a time zone (e.g.
+            `2026-10-01T00:00:00Z`). Only reservations changed at or after
+            this instant are returned. Omitted = from the beginning.
+          schema:
+            type: string
+            example: "2026-10-01T00:00:00Z"
+        - name: cursor
+          in: query
+          required: false
+          description: The `next_cursor` of the previous page, unchanged.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Page size, 1–200.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: One page of the feed.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReservationsListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
@@ -656,14 +904,17 @@ paths:
       - $ref: "#/components/parameters/PartnerReservationIdPath"
     get:
       operationId: getReservation
-      x-status: planned
       tags: [Reservations]
-      summary: Look up a confirmed reservation
+      summary: Look up a reservation
       description: |
-        **Status: planned, not yet deployed.**
+        Returns the reservation as GlampSys currently has it: `status`
+        (`confirmed`, `modified` — its unit or dates were changed after
+        confirmation, `cancelled`, or `completed` — the stay is over), its
+        dates and guests, the price you confirmed, and — once cancelled — the
+        cancellation fee in your currency and when it was cancelled.
 
-        Returns the reservation as GlampSys currently has it, including any
-        modification applied since confirmation.
+        A reservation made with another partner's token, or with the other
+        environment's token (sandbox vs. production), is `404 NOT_FOUND`.
       responses:
         "200":
           description: The reservation.
@@ -677,6 +928,8 @@ paths:
               examples:
                 reservationConfirmed:
                   $ref: "#/components/examples/ReservationConfirmed"
+                reservationCancelled:
+                  $ref: "#/components/examples/ReservationCancelled"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -751,22 +1004,44 @@ paths:
   /reservations/{partner_reservation_id}/cancel:
     post:
       operationId: cancelReservation
-      x-status: planned
       tags: [Reservations]
       summary: Cancel a confirmed reservation
       description: |
-        **Status: planned, not yet deployed.**
+        Cancels the reservation and releases its inventory: the nights are
+        free again in `GET /ari`, on the property's own website and on every
+        other channel the property sells through. The response is the
+        reservation as `GET /reservations/{partner_reservation_id}` returns
+        it, now with `status: cancelled`, `cancellation_fee_minor` and
+        `cancelled_at`.
 
-        Cancels the reservation and releases its inventory. GlampSys never
-        refunds the guest — the partner collected the payment and owns the
-        refund relationship with the guest; this call only tells GlampSys
-        the stay is off. The response's `cancellation_fee_minor` mirrors
-        exactly what the property's cancellation policy would charge a guest
-        booking directly, evaluated against the same clock GlampSys itself
-        uses, so the fee the partner shows their guest matches what GlampSys
-        would have charged. Idempotent: cancelling an already-cancelled
-        reservation returns `200` again. A `completed` reservation (the stay
-        already happened) cannot be cancelled (`409 CONFLICT`).
+        **Money stays with you.** GlampSys never refunds the guest and never
+        charges a cancellation fee — you collected the payment and you own
+        the refund. `cancellation_fee_minor` is what the property's
+        cancellation policy charges for cancelling now, in the reservation's
+        `currency`, and it is computed exactly like the quote's
+        `cancellation_milestones`: cancelling at instant `t` costs the
+        `charge_minor` of the milestone band containing `t`. GlampSys records
+        it as the property's retained revenue; you settle it with the
+        property under your agreement.
+
+        **The guest hears nothing from GlampSys about the cancellation** —
+        whatever email policy the property has agreed with you. Pending
+        pre-arrival and stay emails are withdrawn. Tell the guest yourself.
+
+        **Idempotent.** Retrying with the same `Idempotency-Key` and body
+        replays the original response. Cancelling an already cancelled
+        reservation again — with any key — returns `200` with its current
+        state and no new fee. A reservation the property cancelled itself is
+        returned the same way.
+
+        A `completed` reservation (the stay is over: departure day has
+        passed) cannot be cancelled: `409 CONFLICT` with
+        `details.reason = RESERVATION_COMPLETED`. Cancelling during the stay
+        is allowed (the policy's last band applies). A reservation made with
+        another partner's token, or with the other environment's token
+        (sandbox vs. production), is `404 NOT_FOUND`. A paused property link
+        or an unmapped unit does not block cancelling a reservation you
+        already have.
       parameters:
         - $ref: "#/components/parameters/PartnerReservationIdPath"
         - name: Idempotency-Key
@@ -784,22 +1059,19 @@ paths:
               reason: guest_changed_plans
       responses:
         "200":
-          description: Reservation cancelled (or already was).
+          description: Reservation cancelled (or it already was).
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
+            Idempotent-Replayed:
+              $ref: "#/components/headers/IdempotentReplayed"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ReservationCancellationResult"
-              example:
-                reservation_id: res_01J9Z8QXG3K4M5N6P7Q8R9S0T1
-                partner_reservation_id: GCZ-ORDER-99182
-                status: cancelled
-                cancellation_fee_minor: 0
-                currency: CZK
-                cancelled_revenue_received_minor: 0
-                cancelled_at: "2026-09-10T09:00:00.000Z"
+                $ref: "#/components/schemas/Reservation"
+              examples:
+                reservationCancelled:
+                  $ref: "#/components/examples/ReservationCancelled"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -809,7 +1081,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/CancelConflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
@@ -1004,6 +1276,14 @@ components:
       schema:
         type: integer
         example: 42
+    IdempotentReplayed:
+      description: Present, with the value `true`, when this response is the
+        stored response of an earlier request with the same
+        `Idempotency-Key` rather than the result of processing this one.
+        Absent otherwise.
+      schema:
+        type: string
+        enum: ["true"]
     ETag:
       description: Opaque fingerprint of the response body. Send back as
         `If-None-Match` to get `304 Not Modified` when nothing changed.
@@ -1091,8 +1371,8 @@ components:
               request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
     Conflict:
       description: The request conflicts with the resource's current state
-        (e.g. trying to modify or cancel a reservation that is already
-        `cancelled` or `completed`).
+        (e.g. trying to modify a reservation that is already `cancelled` or
+        `completed`).
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -1103,11 +1383,44 @@ components:
           example:
             error:
               code: CONFLICT
-              message: Reservation is already cancelled.
+              message: Reservation is already cancelled and cannot be modified.
               request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+    CancelConflict:
+      description: |
+        The reservation was not cancelled — `error.code` says why:
+
+        - `CONFLICT` with `details.reason = RESERVATION_COMPLETED` — the stay
+          is over (`status: completed`); nothing changed.
+        - `IDEMPOTENCY_KEY_REUSED` — the key was used for a different request
+          (another reservation or another body), or the original request is
+          still running (`details.state = in_progress`).
+
+        An already cancelled reservation is not a conflict: cancelling it
+        again returns `200` with its current state.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: CONFLICT
+              message: The stay is over; a completed reservation cannot be cancelled.
+              request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+              details:
+                reason: RESERVATION_COMPLETED
+                status: completed
     Unavailable:
-      description: The unit is not available for the whole requested date
-        range.
+      description: The unit cannot be sold for the whole requested date range
+        (`UNAVAILABLE` — booked, blocked or held, or with
+        `details.reason = PRICE_NOT_CONFIGURED` when the operator has not
+        priced some of the nights). Also returned when the
+        `Idempotency-Key` was already used for a different request, or the
+        original request with that key is still being processed
+        (`IDEMPOTENCY_KEY_REUSED`, the latter with
+        `details.state = in_progress`).
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -1136,9 +1449,51 @@ components:
               code: QUOTE_ALREADY_USED
               message: Quote was already confirmed into a reservation.
               request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+    ConfirmConflict:
+      description: |
+        The reservation was not created because of the state of the quote,
+        the inventory or the payment — `error.code` says which:
+
+        - `QUOTE_ALREADY_USED` — the quote was already confirmed into a
+          reservation (by a request with a different `Idempotency-Key`).
+        - `CONFLICT` — your account already has a reservation with this
+          `partner_reservation_id` (`details.reason =
+          DUPLICATE_PARTNER_RESERVATION_ID`).
+        - `PRICE_MISMATCH` — `payment.currency` is not the quote's currency
+          (`details.expected_currency`, `details.received_currency`), or
+          `payment.total_price_minor` is outside your tolerance
+          (`details.expected_total_minor`, `details.received_total_minor`,
+          `details.tolerance_minor`, `details.currency`).
+        - `UNAVAILABLE` — the stay can no longer be sold:
+          `details.reason = HOLD_EXPIRED` (late payment after the hold
+          expired and the dates are gone) or `SALES_PAUSED` (the owner
+          paused sales over the dates).
+        - `IDEMPOTENCY_KEY_REUSED` — the key was used for a different request,
+          or the original request is still running
+          (`details.state = in_progress`).
+
+        In every case nothing was created and nothing was charged by
+        GlampSys; refund the guest where the guest already paid you.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: UNAVAILABLE
+              message: The hold expired and the dates were sold in the meantime.
+              request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+              details:
+                reason: HOLD_EXPIRED
     Gone:
-      description: The quote existed but its hold expired before it was
-        confirmed. Create a new quote and confirm that instead.
+      description: The quote can no longer be confirmed — its hold expired
+        more than 24 hours ago (`details.status = expired`), or you released
+        it with `DELETE /quotes/{quote_id}` (`details.status = cancelled`).
+        Nothing was created; refund the guest or start over with a new
+        quote.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -1149,13 +1504,16 @@ components:
           example:
             error:
               code: QUOTE_EXPIRED
-              message: Quote hold has expired.
+              message: The quote's hold expired more than 24 hours ago.
               request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+              details:
+                status: expired
+                expires_at: "2026-09-10T08:30:00.000Z"
     UnprocessableEntity:
       description: Syntactically valid but rejected by a business rule —
-        capacity exceeded, an arrival/departure day the property doesn't
-        allow, EUR requested on a line with no fixed exchange rate
-        configured, or a partner/unit hold cap reached.
+        `error.details.rule` says which one (`CURRENCY`, `CAPACITY`,
+        `BOOKING_WINDOW`, `OUT_OF_SEASON`, `ARRIVAL_DAY`, `DEPARTURE_DAY`,
+        `MIN_STAY`), and the rest of `details` carries the rule's limit.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -1166,11 +1524,11 @@ components:
           example:
             error:
               code: BUSINESS_RULE_VIOLATION
-              message: Maximum concurrently held quotes reached for this unit.
+              message: The stay is shorter than the minimum stay for these dates.
               request_id: req_01J9Z8QXG3K4M5N6P7Q8R9S0T1
               details:
-                reason: UNIT_HOLD_LIMIT
-                limit: 3
+                rule: MIN_STAY
+                min_nights: 2
     PayloadTooLarge:
       description: Request body exceeds the 64 kB limit.
       headers:
@@ -1188,8 +1546,11 @@ components:
               details:
                 max_bytes: 65536
     TooManyRequests:
-      description: Rate limit exceeded for this endpoint's class (read,
-        quote, or write). Respect `Retry-After`.
+      description: >-
+        Rate limit exceeded for this endpoint's class (read, quote, or write;
+        `details.class`) — or, on `POST /quotes` with `hold: true`, a hold cap
+        reached (`details.rule = HOLD_LIMIT`, `details.scope` = `partner` or
+        `unit`). Respect `Retry-After`.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -1232,6 +1593,7 @@ components:
         quote_id: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
         status: held
         unit_id: unit_123
+        partner_unit_id: GCZ-8842
         check_in: "2026-10-01"
         check_out: "2026-10-04"
         nights: 3
@@ -1243,11 +1605,11 @@ components:
           pets: 0
         breakdown:
           - type: accommodation
-            label: Accommodation
+            label: Accommodation, 3 nights
             amount_minor: 630000
           - type: local_tax
             label: Local tax
-            amount_minor: 6300
+            amount_minor: 18900
         nightly:
           - date: "2026-10-01"
             amount_minor: 210000
@@ -1261,17 +1623,23 @@ components:
         taxes:
           local_tax:
             included: true
-            amount_minor: 6300
+            collected_by: partner
+            amount_minor: 18900
             per_person_per_night_minor: 2100
-        total_price_minor: 636300
+        total_price_minor: 648900
         cancellation_milestones:
           - days_before_checkin: 7
             charge_percent: 0
             charge_minor: 0
+            from: null
+            until: "2026-09-24T00:00:00.000Z"
           - days_before_checkin: 0
             charge_percent: 100
-            charge_minor: 636300
-        expires_at: "2026-09-10T08:15:00.000Z"
+            charge_minor: 648900
+            from: "2026-09-24T00:00:00.001Z"
+            until: null
+        hold_ttl_seconds: 1800
+        expires_at: "2026-09-10T08:30:00.000Z"
         created_at: "2026-09-10T08:00:00.000Z"
     QuotePriced:
       summary: A price-only quote (hold = false)
@@ -1279,6 +1647,7 @@ components:
         quote_id: null
         status: priced
         unit_id: unit_123
+        partner_unit_id: GCZ-8842
         check_in: "2026-10-01"
         check_out: "2026-10-04"
         nights: 3
@@ -1290,11 +1659,11 @@ components:
           pets: 0
         breakdown:
           - type: accommodation
-            label: Accommodation
+            label: Accommodation, 3 nights
             amount_minor: 630000
           - type: local_tax
             label: Local tax
-            amount_minor: 6300
+            amount_minor: 18900
         nightly:
           - date: "2026-10-01"
             amount_minor: 210000
@@ -1308,49 +1677,152 @@ components:
         taxes:
           local_tax:
             included: true
-            amount_minor: 6300
+            collected_by: partner
+            amount_minor: 18900
             per_person_per_night_minor: 2100
-        total_price_minor: 636300
+        total_price_minor: 648900
         cancellation_milestones:
           - days_before_checkin: 7
             charge_percent: 0
             charge_minor: 0
+            from: null
+            until: "2026-09-24T00:00:00.000Z"
           - days_before_checkin: 0
             charge_percent: 100
-            charge_minor: 636300
+            charge_minor: 648900
+            from: "2026-09-24T00:00:00.001Z"
+            until: null
+        hold_ttl_seconds: null
+        expires_at: null
+        created_at: "2026-09-10T08:00:00.000Z"
+    QuoteCancelled:
+      summary: A quote released with DELETE /quotes/{quote_id}
+      value:
+        quote_id: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+        status: cancelled
+        unit_id: unit_123
+        partner_unit_id: GCZ-8842
+        check_in: "2026-10-01"
+        check_out: "2026-10-04"
+        nights: 3
+        currency: CZK
+        fx_rate: null
+        guests:
+          adults: 2
+          children: [8]
+          pets: 0
+        breakdown:
+          - type: accommodation
+            label: Accommodation, 3 nights
+            amount_minor: 630000
+          - type: local_tax
+            label: Local tax
+            amount_minor: 18900
+        nightly:
+          - date: "2026-10-01"
+            amount_minor: 210000
+            rate_type: weekday
+          - date: "2026-10-02"
+            amount_minor: 210000
+            rate_type: weekday
+          - date: "2026-10-03"
+            amount_minor: 210000
+            rate_type: weekend
+        taxes:
+          local_tax:
+            included: true
+            collected_by: partner
+            amount_minor: 18900
+            per_person_per_night_minor: 2100
+        total_price_minor: 648900
+        cancellation_milestones:
+          - days_before_checkin: 7
+            charge_percent: 0
+            charge_minor: 0
+            from: null
+            until: "2026-09-24T00:00:00.000Z"
+          - days_before_checkin: 0
+            charge_percent: 100
+            charge_minor: 648900
+            from: "2026-09-24T00:00:00.001Z"
+            until: null
+        hold_ttl_seconds: null
         expires_at: null
         created_at: "2026-09-10T08:00:00.000Z"
     ReservationConfirmed:
       summary: A confirmed reservation
       value:
         reservation_id: res_01J9Z8QXG3K4M5N6P7Q8R9S0T1
-        partner_reservation_id: GCZ-ORDER-99182
+        partner_reservation_id: GCZ-938482
+        partner_reservation_reference: GCZ-ORDER-99182
         booking_code: "20261001-01"
         status: confirmed
+        quote_id: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
         unit_id: unit_123
+        partner_unit_id: GCZ-8842
         property:
           property_id: prop_7
           name: Glamping Posázaví
           slug: posazavi
         check_in: "2026-10-01"
         check_out: "2026-10-04"
+        nights: 3
         guests:
           adults: 2
           children: [8]
           pets: 0
         currency: CZK
-        total_price_minor: 636300
+        total_price_minor: 648900
         fx_rate: null
         breakdown:
           - type: accommodation
-            label: Accommodation
+            label: Accommodation, 3 nights
             amount_minor: 630000
           - type: local_tax
             label: Local tax
-            amount_minor: 6300
-        guest_portal_url: "https://app.glampsys.cz/booking/checkin/9f8e7d6c"
+            amount_minor: 18900
+        cancellation_fee_minor: null
+        cancelled_at: null
+        guest_portal_url: "https://glampsys.cz/booking/checkin/9f8e7d6c5b4a"
         created_at: "2026-09-10T08:05:00.000Z"
         updated_at: "2026-09-10T08:05:00.000Z"
+    ReservationCancelled:
+      summary: A reservation cancelled through the API
+      value:
+        reservation_id: res_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+        partner_reservation_id: GCZ-938482
+        partner_reservation_reference: GCZ-ORDER-99182
+        booking_code: "20261001-01"
+        status: cancelled
+        quote_id: q_01J9Z8QXG3K4M5N6P7Q8R9S0T1
+        unit_id: unit_123
+        partner_unit_id: GCZ-8842
+        property:
+          property_id: prop_7
+          name: Glamping Posázaví
+          slug: posazavi
+        check_in: "2026-10-01"
+        check_out: "2026-10-04"
+        nights: 3
+        guests:
+          adults: 2
+          children: [8]
+          pets: 0
+        currency: CZK
+        total_price_minor: 648900
+        fx_rate: null
+        breakdown:
+          - type: accommodation
+            label: Accommodation, 3 nights
+            amount_minor: 630000
+          - type: local_tax
+            label: Local tax
+            amount_minor: 18900
+        cancellation_fee_minor: 324450
+        cancelled_at: "2026-09-25T14:12:03.000Z"
+        guest_portal_url: "https://glampsys.cz/booking/checkin/9f8e7d6c5b4a"
+        created_at: "2026-09-10T08:05:00.000Z"
+        updated_at: "2026-09-25T14:12:03.000Z"
 
   schemas:
     # ── Shared primitives ────────────────────────────────────────────────
@@ -1364,8 +1836,10 @@ components:
       type: string
       minLength: 1
       maxLength: 255
+      pattern: '^[\x20-\x7E]+$'
       description: Unique per logical write attempt. Reuse it to retry the
-        exact same attempt; a new attempt needs a new key.
+        exact same attempt; a new attempt needs a new key. Printable ASCII
+        only (`0x20`–`0x7E`); see the introduction's Idempotency section.
       example: gcz-checkout-99182-confirm
 
     Money:
@@ -1391,7 +1865,9 @@ components:
           minimum: 1
         children:
           type: array
-          description: One entry per child, each their age in whole years.
+          description: One entry per child, each their age in whole years
+            on the arrival day. Ages can change the price where the operator
+            prices by the number and ages of guests.
           items:
             type: integer
             minimum: 0
@@ -1428,13 +1904,17 @@ components:
       properties:
         terms:
           type: boolean
+          description: The guest accepted the property's terms. Must be
+            `true` on `POST /reservations/confirm`.
         gdpr:
           type: boolean
+          description: The guest was informed about the processing of their
+            personal data. Must be `true` on `POST /reservations/confirm`.
         accepted_at:
           type: string
-          format: date-time
           description: When the guest accepted, at the partner's checkout —
-            not when this API call was made.
+            not when this API call was made. ISO 8601 timestamp with a time
+            zone, e.g. `2026-09-10T08:04:30Z`.
         source:
           type: string
           description: Free-text identifier of where consent was captured,
@@ -1457,16 +1937,42 @@ components:
 
     CancellationMilestone:
       type: object
-      required: [days_before_checkin, charge_percent, charge_minor]
+      required: [days_before_checkin, charge_percent, charge_minor, from, until]
+      description: |
+        One band of the cancellation policy. Bands are listed in time order
+        and are contiguous to the millisecond: each band's `from` is the
+        previous band's `until` plus one millisecond. `from` and `until` are
+        both inclusive; cancelling at instant `t` costs the band with
+        `from <= t <= until` (a `null` end is open).
+
+        The instants are computed exactly the way the cancellation fee is
+        computed when a reservation is cancelled: from midnight UTC of the
+        check-in day, counting whole 24-hour days. A band listed with
+        `days_before_checkin: 7` therefore ends at check-in day 00:00 UTC
+        minus 7 × 24 hours — not at Prague midnight.
       properties:
         days_before_checkin:
-          type: integer
+          type: [integer, "null"]
+          description: The property's rule this band comes from — it applies
+            while at least this many whole days remain. `null` for the band
+            no configured rule covers (100 % once the last rule's window has
+            passed; 0 % for the single band of a property with no rules).
         charge_percent:
           type: number
         charge_minor:
           type: integer
-          description: What `POST /reservations/{id}/cancel` would actually
-            charge if cancelled at this milestone, in the quote's currency.
+          description: What cancelling inside this band costs, in the quote's
+            currency — `charge_percent` of `total_price_minor`, rounded to the
+            minor unit.
+        from:
+          type: [string, "null"]
+          description: First instant of the band (ISO 8601 UTC, inclusive).
+            `null` = the band has no start (it already applies when the
+            quote is created, unless a later band has begun).
+        until:
+          type: [string, "null"]
+          description: Last instant of the band (ISO 8601 UTC, inclusive).
+            `null` = the band never ends.
 
     LocalTax:
       type: object
@@ -1669,7 +2175,7 @@ components:
       type: string
       enum: [sandbox, production]
 
-    # ── ARI (planned) ──────────────────────────────────────────────────────
+    # ── ARI (GET /ari — deployed) ──────────────────────────────────────────
     AriDayUnavailableReason:
       type: string
       enum: [CURRENCY_NOT_ENABLED]
@@ -1750,45 +2256,61 @@ components:
         generated_at:
           type: string
 
-    # ── Quotes (planned) ───────────────────────────────────────────────────
+    # ── Quotes (POST /quotes, GET + DELETE /quotes/{id} — deployed) ─────────
     CreateQuoteBody:
       type: object
       required: [unit_id, check_in, check_out, guests, hold]
       properties:
         unit_id:
           type: string
+          description: '`unit_id` from `GET /units`, or your own
+            `partner_unit_id` — either form is accepted.'
         check_in:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
+          description: Arrival day, `YYYY-MM-DD` (a real calendar date).
+          example: "2026-10-01"
         check_out:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
+          description: Departure day, `YYYY-MM-DD` — after `check_in`, at most
+            366 nights later. The departure day itself is not a night of the
+            stay; another guest can arrive that day.
+          example: "2026-10-04"
         guests:
           $ref: "#/components/schemas/Guests"
         currency:
           allOf:
             - $ref: "#/components/schemas/Currency"
           default: CZK
-          description: '`EUR` is only honoured when the partner''s line has a
-            fixed exchange rate configured; otherwise pricing falls back to
-            CZK (see `GET /ari`''s `price_unavailable_reason` for the
-            read-only equivalent of this fallback).'
+          description: '`EUR` is only priced when the unit''s line has EUR
+            enabled with a fixed exchange rate; anywhere else the request is
+            refused with `422 BUSINESS_RULE_VIOLATION` and
+            `details.rule = CURRENCY` — never silently priced in CZK.'
         hold:
           type: boolean
           description: '`true` reserves the inventory for a short window and
-            requires `guest` and `Idempotency-Key`. `false` returns a price
-            only — no state is created, `guest` is not required, and the
-            response''s `quote_id` is `null`.'
+            requires `Idempotency-Key`. `false` returns a price only — no
+            state is created and the response''s `quote_id` is `null`.'
         guest:
-          description: Required when `hold` is `true`; ignored when `false`.
+          description: 'Optional with `hold: true` — the guest you already
+            know from your checkout form. The operator sees the name on the
+            hold in their calendar; nothing else is created from it (the
+            reservation''s guest is the one you send to confirm), and it is
+            erased 24 hours after the quote expires or is released. Never
+            echoed back in a response. Must be absent or `null` with
+            `hold: false` (`400 INVALID_REQUEST`): there is no reason to send
+            personal data for a price check.'
           oneOf:
             - $ref: "#/components/schemas/GuestContact"
             - type: "null"
         partner_reservation_reference:
           type: string
-          description: The partner's own free-text order/tracking id. Echoed
-            back in `Reservation.partner_reservation_reference` if this quote
-            is later confirmed — purely for the partner's own
+          maxLength: 255
+          description: The partner's own free-text order/tracking id. Stored
+            with a held quote and echoed back in
+            `Reservation.partner_reservation_reference` if this quote is
+            later confirmed — purely for the partner's own
             cross-referencing, GlampSys does not interpret it.
 
     QuoteStatus:
@@ -1818,9 +2340,12 @@ components:
       properties:
         date:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
+          description: The night starting this day, `YYYY-MM-DD`.
         amount_minor:
           type: integer
+          description: That night's price with your markup, in the quote's
+            currency — before promotions, without local tax.
         rate_type:
           type: string
           description: Free-text label of which rate priced this night, e.g.
@@ -1833,6 +2358,7 @@ components:
         - quote_id
         - status
         - unit_id
+        - partner_unit_id
         - check_in
         - check_out
         - nights
@@ -1844,6 +2370,7 @@ components:
         - taxes
         - total_price_minor
         - cancellation_milestones
+        - hold_ttl_seconds
         - expires_at
         - created_at
       properties:
@@ -1857,12 +2384,16 @@ components:
           $ref: "#/components/schemas/QuoteStatus"
         unit_id:
           type: string
+        partner_unit_id:
+          type: [string, "null"]
+          description: Your identifier for the unit, when one is mapped
+            (sandbox demo units may have none).
         check_in:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
         check_out:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
         nights:
           type: integer
         currency:
@@ -1877,7 +2408,11 @@ components:
           $ref: "#/components/schemas/Guests"
         breakdown:
           type: array
-          description: Sums to `total_price_minor`.
+          description: Sums to `total_price_minor`. `accommodation` (the
+            nights with your markup), `promotion` (an automatic promotion with
+            your markup; negative for a discount, positive for a surcharge;
+            absent when none applies) and `local_tax` (only when
+            `taxes.local_tax.included` is `true` and the tax is not zero).
           items:
             $ref: "#/components/schemas/QuoteBreakdownItem"
         nightly:
@@ -1890,14 +2425,24 @@ components:
           properties:
             local_tax:
               type: object
-              required: [included, amount_minor, per_person_per_night_minor]
+              required: [included, collected_by, amount_minor, per_person_per_night_minor]
               properties:
                 included:
                   type: boolean
                   description: Mirrors the unit's `local_tax.mode` —
-                    `true` when it is already inside `total_price_minor`.
+                    `true` when it is already inside `total_price_minor` (as
+                    a `local_tax` breakdown line), `false` when the property
+                    collects it on site and this amount is informational.
+                collected_by:
+                  type: string
+                  enum: [partner, property_on_site]
+                  description: Who collects the tax from the guest — you
+                    (inside the price you charge) or the property on arrival.
                 amount_minor:
                   type: integer
+                  description: '`per_person_per_night` × all guests (adults
+                    and children) × nights, in the quote''s currency. Never
+                    marked up.'
                 per_person_per_night_minor:
                   type: integer
         total_price_minor:
@@ -1908,55 +2453,121 @@ components:
             evaluated from `check_in`. Sourced from the exact same clock
             arithmetic `POST /reservations/{id}/cancel` uses, so these
             numbers are what will actually be charged, not an approximation.
+            All bands are listed, including those that already lie in the
+            past when the quote is created.
           items:
             $ref: "#/components/schemas/CancellationMilestone"
+        hold_ttl_seconds:
+          type: [integer, "null"]
+          description: How long this hold lasts from creation. `null` unless
+            `status` is `held`.
         expires_at:
+          type: [string, "null"]
           description: >-
-            When the hold releases on its own. `null` when this quote was
-            created with `hold: false`, or once `status` is no longer
-            `held`.
-          oneOf:
-            - type: string
-              format: date-time
-            - type: "null"
+            When the hold releases on its own, ISO 8601 UTC. `null` when this
+            quote was created with `hold: false`, or once `status` is no
+            longer `held`.
         created_at:
           type: string
-          format: date-time
+          description: ISO 8601 UTC.
 
-    QuoteCancellationResult:
+    # ── Reservations (confirm, lookup, list — deployed since 1.3.0) ─────────
+    ReservationGuest:
       type: object
-      required: [quote_id, status, cancelled_at]
+      required: [first_name, last_name, email, phone, language]
       properties:
-        quote_id:
+        first_name:
           type: string
+          minLength: 1
+          maxLength: 100
+        last_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        phone:
+          type: string
+          maxLength: 40
+        language:
+          type: string
+          pattern: '^[A-Za-z]{2}$'
+          description: ISO 639-1 language code (`cs`, `en`, `de`…) — the
+            language of the emails GlampSys itself sends the guest after
+            confirmation.
+          example: cs
+        nationality:
+          type: [string, "null"]
+          pattern: '^[A-Za-z]{2}$'
+          description: ISO 3166-1 alpha-2 country code, when you know it.
+            Optional — GlampSys collects the guest's documents itself in the
+            online check-in.
+          example: CZ
+
+    ReservationPayment:
+      type: object
+      required: [status, total_price_minor, currency, paid_at]
+      description: What the guest actually paid you for this stay.
+      properties:
         status:
           type: string
-          enum: [cancelled]
-        cancelled_at:
+          enum: [paid]
+          description: Only `paid` is supported — confirm once the guest has
+            paid you in full.
+        total_price_minor:
+          type: integer
+          minimum: 0
+          description: The amount the guest paid, in minor units of
+            `currency`. Compared with the quote's `total_price_minor`
+            (see the operation description).
+        currency:
+          $ref: "#/components/schemas/Currency"
+        paid_at:
           type: string
-          format: date-time
+          description: When the guest paid you, ISO 8601 timestamp with a
+            time zone.
+          example: "2026-09-10T08:04:52Z"
 
-    # ── Reservations (planned) ─────────────────────────────────────────────
     ConfirmReservationBody:
       type: object
-      required: [guest, consents]
+      required: [quote_id, partner_reservation_id, guest, consents, payment]
       properties:
         quote_id:
           type: string
-          description: Required unless the partner's line has
-            `allow_confirm_without_quote` enabled (an exception granted per
-            partner, not part of the default flow) — normal integrations
-            always price with `POST /quotes` first and confirm that id.
-        guest:
-          $ref: "#/components/schemas/GuestContact"
-        consents:
-          $ref: "#/components/schemas/Consents"
+          description: >-
+            The `quote_id` of a quote you created with `hold: true`.
+            (Confirming without a quote is not available in this version.)
+        partner_reservation_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._:-]+$'
+          description: Your own id for this reservation — unique within your
+            account. It is the id you use afterwards in
+            `GET /reservations/{partner_reservation_id}` and the `/modify`
+            and `/cancel` paths, so it may only contain letters, digits and
+            `.`, `_`, `:`, `-`.
+          example: GCZ-938482
         partner_reservation_reference:
           type: string
-          description: The partner's own order id. Stored and returned as
-            `Reservation.partner_reservation_reference`; also doubles as the
-            id you use later with `GET /reservations/{partner_reservation_id}`
-            when you set it — see that operation's description.
+          maxLength: 255
+          description: Optional free-text order/tracking id of yours. When
+            sent it replaces the one stored with the quote; echoed back as
+            `Reservation.partner_reservation_reference`. GlampSys does not
+            interpret it.
+        guest:
+          $ref: "#/components/schemas/ReservationGuest"
+        consents:
+          $ref: "#/components/schemas/Consents"
+        payment:
+          $ref: "#/components/schemas/ReservationPayment"
+        notes:
+          type: [string, "null"]
+          maxLength: 2000
+          description: The guest's message to the property (arrival time,
+            wishes). Shown to the property's staff.
 
     ReservationStatus:
       type: string
@@ -1967,17 +2578,23 @@ components:
       required:
         - reservation_id
         - partner_reservation_id
+        - partner_reservation_reference
         - booking_code
         - status
+        - quote_id
         - unit_id
+        - partner_unit_id
         - property
         - check_in
         - check_out
+        - nights
         - guests
         - currency
         - total_price_minor
         - fx_rate
         - breakdown
+        - cancellation_fee_minor
+        - cancelled_at
         - guest_portal_url
         - created_at
         - updated_at
@@ -1991,9 +2608,12 @@ components:
           example: res_01J9Z8QXG3K4M5N6P7Q8R9S0T1
         partner_reservation_id:
           type: string
-          description: Echoes `ConfirmReservationBody.partner_reservation_reference`.
-            Use this as the id in `GET /reservations/{partner_reservation_id}`
-            and the `/modify` and `/cancel` paths.
+          description: The `partner_reservation_id` you sent in
+            `POST /reservations/confirm`.
+        partner_reservation_reference:
+          type: [string, "null"]
+          description: Your free-text reference from the confirm request,
+            or else from the quote; `null` when you sent none.
         booking_code:
           type: string
           description: Human-readable label shown in the GlampSys admin
@@ -2001,43 +2621,83 @@ components:
             `reservation_id`.
         status:
           $ref: "#/components/schemas/ReservationStatus"
+        quote_id:
+          type: [string, "null"]
+          description: The quote this reservation was confirmed from.
         unit_id:
           type: string
+          description: The unit the reservation is on now (the operator may
+            have moved it — then `status` is `modified`).
+        partner_unit_id:
+          type: [string, "null"]
+          description: Your identifier for that unit, when one is mapped.
         property:
           $ref: "#/components/schemas/PropertyRef"
         check_in:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
         check_out:
           type: string
-          format: date
+          pattern: '^\d{4}-\d{2}-\d{2}$'
+        nights:
+          type: integer
         guests:
           $ref: "#/components/schemas/Guests"
         currency:
           $ref: "#/components/schemas/Currency"
         total_price_minor:
           type: integer
+          description: The price you confirmed, in `currency` — the quote's
+            total.
         fx_rate:
+          description: CZK per one unit of `currency`, fixed by the quote.
+            `null` when `currency` is `CZK`.
           oneOf:
             - type: number
             - type: "null"
         breakdown:
           type: array
+          description: The quote's price lines; they sum to
+            `total_price_minor`.
           items:
             $ref: "#/components/schemas/QuoteBreakdownItem"
+        cancellation_fee_minor:
+          type: [integer, "null"]
+          description: Once `status` is `cancelled`, the cancellation fee
+            GlampSys recorded, in `currency` — for a cancellation you made
+            with `POST /reservations/{partner_reservation_id}/cancel`,
+            exactly the amount that call returned. `null` otherwise.
+            GlampSys never collects it from the guest.
+        cancelled_at:
+          type: [string, "null"]
+          description: When the reservation was cancelled, ISO 8601 UTC;
+            `null` unless cancelled.
         guest_portal_url:
           type: string
-          format: uri
-          description: Guest-facing check-in portal link. Safe to hand
-            directly to the guest, e.g. in the partner's own confirmation
-            email — GlampSys does not email the guest before confirmation.
+          description: The guest's online check-in portal. Safe to hand
+            directly to the guest, e.g. in your own confirmation email.
         created_at:
           type: string
-          format: date-time
+          description: ISO 8601 UTC.
         updated_at:
           type: string
-          format: date-time
+          description: Last change of the reservation record, ISO 8601 UTC —
+            the value `GET /reservations?updated_since=` filters on.
 
+    ReservationsListResponse:
+      type: object
+      required: [reservations, next_cursor]
+      properties:
+        reservations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Reservation"
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` to get the next page; `null` on the
+            last page.
+
+    # ── Reservations: modify (planned), cancel ─────────────────────────────
     ModifyReservationBody:
       type: object
       required: [quote_id]
@@ -2052,42 +2712,10 @@ components:
       properties:
         reason:
           type: string
-          description: Free-text, for GlampSys's own records. Never shown to
-            guests or property staff verbatim.
-
-    ReservationCancellationResult:
-      type: object
-      required:
-        - reservation_id
-        - partner_reservation_id
-        - status
-        - cancellation_fee_minor
-        - currency
-        - cancelled_revenue_received_minor
-        - cancelled_at
-      properties:
-        reservation_id:
-          type: string
-        partner_reservation_id:
-          type: string
-        status:
-          type: string
-          enum: [cancelled]
-        cancellation_fee_minor:
-          type: integer
-          description: What the property's cancellation policy charges,
-            evaluated now against `check_in` — `0` for a free cancellation.
-        currency:
-          $ref: "#/components/schemas/Currency"
-        cancelled_revenue_received_minor:
-          type: integer
-          description: Equal to `cancellation_fee_minor` — the portion of
-            what the guest already paid the partner that GlampSys records as
-            retained revenue for this property. GlampSys never refunds the
-            guest itself; see the operation description.
-        cancelled_at:
-          type: string
-          format: date-time
+          maxLength: 500
+          description: Free-text, for GlampSys's own records (e.g.
+            `guest_request`). Never shown to guests or property staff
+            verbatim. Optional; the body itself is optional.
 
     # ── Webhooks (planned) ─────────────────────────────────────────────────
     # Each event below inlines its own single-value `event_type` enum rather
@@ -2246,7 +2874,33 @@ components:
               type: string
             details:
               type: object
-              description: Present on some errors, shaped per `code` (e.g.
-                `RATE_LIMITED` carries `class` and `limit`). Never contains a
-                stack trace or SQL.
+              description: |
+                Present on some errors, shaped per `code`. Never contains a
+                stack trace or SQL. The keys you can branch on:
+
+                - `RATE_LIMITED`: `class` (`read`, `quote`, `write`) and
+                  `limit` for a rate limit; `rule: HOLD_LIMIT`, `scope`
+                  (`partner`, `unit`) and `limit` for a hold cap.
+                - `BUSINESS_RULE_VIOLATION`: `rule` (`CURRENCY`, `CAPACITY`,
+                  `BOOKING_WINDOW`, `OUT_OF_SEASON`, `ARRIVAL_DAY`,
+                  `DEPARTURE_DAY`, `MIN_STAY`) plus that rule's limit.
+                - `UNAVAILABLE`: `reason: PRICE_NOT_CONFIGURED` (with
+                  `dates`) when some nights have no price; on
+                  `POST /reservations/confirm` `reason: HOLD_EXPIRED` (late
+                  payment, the dates are gone) or `reason: SALES_PAUSED`;
+                  absent when the dates are simply taken.
+                - `PRICE_MISMATCH`: `expected_currency` and
+                  `received_currency`, or `expected_total_minor`,
+                  `received_total_minor`, `tolerance_minor` and `currency`.
+                - `QUOTE_EXPIRED`: `status` (`expired` or `cancelled`) and
+                  `expires_at` of the quote's hold.
+                - `CONFLICT`: `reason: DUPLICATE_PARTNER_RESERVATION_ID` when
+                  the `partner_reservation_id` is already used.
+                - `IDEMPOTENCY_KEY_REUSED`: `state: in_progress` while the
+                  original request is still running; absent when the key was
+                  used for a different request.
+                - `NOT_FOUND`: `reason: UNKNOWN_ENDPOINT` for a path that
+                  does not exist (yet).
+                - `INVALID_REQUEST`: `field`, `parameter` or `header` naming
+                  the offending input, when there is one.
               additionalProperties: true

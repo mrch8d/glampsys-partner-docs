@@ -1,6 +1,6 @@
 # GlampSys Partner API
 
-> REST API through which a booking portal reads glamping units, daily availability, indicative rates and stay restrictions from GlampSys, and — in later stages — prices a stay with a hold, confirms paid reservations and receives webhooks. The OpenAPI 3.1 contract is the source of truth; operations marked `x-status: planned` are not live yet.
+> REST API through which a booking portal reads glamping units, daily availability, indicative rates and stay restrictions from GlampSys, prices a stay with a hold, confirms reservations the guest paid to the portal, cancels and reconciles them — and, in later stages, modifies them and receives webhooks. The OpenAPI 3.1 contract is the source of truth; operations marked `x-status: planned` are not live yet.
 
 Base URL: https://glampsys.cz/api/partner/v1 — bearer token `gsp_test_…` (sandbox) or `gsp_live_…` (production). All amounts are integer minor units with an ISO 4217 currency.
 
