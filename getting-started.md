@@ -82,8 +82,10 @@ Each day has `available`, `available_count`, `min_stay`, `arrival_allowed`,
 also has `price_unavailable_reason: "CURRENCY_NOT_ENABLED"`. Do not replace
 that with a made-up currency conversion.
 
-For this phase, call only these three GET endpoints. ARI is not a binding
-quote and must not be used to collect payment.
+These calls change nothing. ARI is not a binding quote and must not be used
+to collect payment — continue in the sandbox with the booking flow below
+(quote, hold, confirm, cancel), which is live in the same sandbox with the
+same token.
 
 ## Identifiers
 
